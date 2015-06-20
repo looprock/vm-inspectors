@@ -1,0 +1,232 @@
+#!/usr/bin/env python
+import subprocess
+import shlex
+import re
+import sys
+import socket
+import json
+import datetime
+import requests
+import getopt
+
+vmmgr_host = "http://10.103.3.217:8080"
+
+
+def usage():
+    print sys.argv[0] + """ [options] [appname]
+    options:
+
+    -h/--help         -  print usage summary
+    -x/--xm           -  us 'xm' commands instead of virsh
+    -d/--debug        -  enable debug mode
+    -r/--dryrun       -  dry run: don't post to API
+    -s/--silent       -  don't output anything
+"""
+
+silent = False
+xm = False
+debug = False
+dryrun = False
+
+try:
+    opts, remainder = getopt.gnu_getopt(sys.argv[1:], "hxdrs", ["help", "xm", "debug", "silent", "dryrun"])
+except getopt.GetoptError:
+    usage()
+    sys.exit(2)
+for opt, arg in opts:
+    if opt in ("-h", "--help"):
+        usage()
+        sys.exit()
+    elif opt in ("-s", "--silent"):
+        silent = True
+    elif opt in ("-x", "--xm"):
+        xm = True
+    elif opt in ("-d", "--debug"):
+        debug = True
+    elif opt in ("-r", "--dryrun"):
+        dryrun = True
+
+
+# start by throwing this directly at the API,
+# but move to a queue and consumer based model shortly
+
+fqdn = socket.getfqdn()
+update = datetime.datetime.now().isoformat()
+used_vcpus = 0
+
+
+def bug(msg):
+    if debug:
+        print "DEBUG - %s" % msg
+
+# get currently registered guests
+cur_guests = {}
+req = requests.get('%s/api/guests' % vmmgr_host)
+for i in req.json():
+    cur_guests[i['hostname']] = i['id']
+
+# get currently registered hosts
+cur_hosts = {}
+req = requests.get('%s/api/hosts' % vmmgr_host)
+for i in req.json():
+    cur_hosts[i['hostname']] = i['id']
+
+# generate nested python dictionaries, copied from here:
+# http://stackoverflow.com/questions/635483/what-is-the-best-way-to-implement-nested-dictionaries-in-python
+
+
+class AutoVivification(dict):
+    """Implementation of perl's autovivification feature."""
+    def __getitem__(self, item):
+        try:
+            return dict.__getitem__(self, item)
+        except KeyError:
+            value = self[item] = type(self)()
+            return value
+
+
+def comm(command_line):
+    """Return output of a system command"""
+    process = subprocess.Popen(shlex.split(command_line), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out, error = process.communicate()
+    return {"out": out, "error": error}
+
+# virsh functions
+
+# get memory for a dom:
+
+
+def virsh_get_memory(id):
+    dom = comm("virsh dommemstat %s" % id)
+    if dom['error']:
+        return "ERROR"
+
+    for line in dom['out'].split("\n"):
+        search = re.match("^actual", line)
+        if search:
+            return line.split()[1]
+
+# get vcpu max for a dom
+
+
+def virsh_get_maxvcpus(id):
+    dom = comm("virsh vcpucount %s" % id)
+    if dom['error']:
+        return "ERROR"
+
+    for cpuinfo in dom['out'].split('\n'):
+            maxsearch = re.match("^maximum", cpuinfo)
+            if maxsearch:
+                cpuline = cpuinfo.split()
+                return cpuline[2]
+
+
+def virsh_get_guests():
+    vlist = comm('virsh list')
+    if vlist['error']:
+        print vlist['error']
+        sys.exit(1)
+    else:
+        return vlist
+
+
+def vmmgr_update(vms, endpoint, current):
+    bug(json.dumps(vms))
+    if vms['hostname'] in current.keys():
+        vms['id'] = current[vms['hostname']]
+        url = "%s/api/%s/%s/" % (vmmgr_host, endpoint, current[vms['hostname']])
+    else:
+        url = "%s/api/%s" % (vmmgr_host, endpoint)
+    bug(url)
+    headers = {'Content-Type': 'application/json', 'Accept': 'application/json'}
+    if not dryrun:
+        pub = requests.post(url, data=json.dumps(vms), headers=headers)
+        bug(pub.content)
+        if not silent:
+            print "submittion for %s %s: %s" % (endpoint, vms['hostname'], str(pub.status_code))
+
+
+# xm functions
+
+def xm_get_guests():
+    vlist = comm('xm list')
+    if vlist['error']:
+        print vlist['error']
+        sys.exit(1)
+    else:
+        return vlist
+
+# host functions
+
+
+def host_mem():
+    memory = {}
+    for line in comm('free')['out'].split('\n'):
+        search = re.match("^Mem:.*$", line)
+        if search:
+            match = line.split()
+            memory['total'] = match[1]
+            memory['buffers'] = match[5]
+            memory['cached'] = match[6]
+            memory['free'] = (int(match[3]) + int(match[5]) + int(match[6]))
+    return memory
+
+
+vms = AutoVivification()
+
+if xm:
+    bug("processing xm information")
+    vlist = xm_get_guests()
+    for line in vlist['out'].split('\n'):
+        if line:
+            vm = line.split()
+            if len(vm) == 6:
+                if vm[0] != "Name" and vm[0] != "Domain-0":
+                    vms['domain_id'] = int(vm[1])
+                    vms['kvmhost'] = fqdn
+                    vms['hostname'] = vm[0]
+                    vms['status'] = "running"
+                    vms['maxvcpus'] = int(vm[3])
+                    used_vcpus = used_vcpus + int(vm[3])
+                    bug("used_vcpus: %s" % used_vcpus)
+                    vms['actual_mem'] = int(vm[2])
+                    vms['last_update'] = update
+                    vmmgr_update(vms, 'guests', cur_guests)
+else:
+    bug("processing virsh information")
+    vlist = virsh_get_guests()
+    for line in vlist['out'].split('\n'):
+        search = re.match("^\W\d+\W.*$", line)
+        if search:
+            vm = line.split()
+            vms['domain_id'] = int(vm[0])
+            vms['kvmhost'] = fqdn
+            vms['hostname'] = vm[1]
+            vms['status'] = vm[2]
+            vms['maxvcpus'] = int(virsh_get_maxvcpus(vm[0]))
+            if virsh_get_maxvcpus(vm[0]) != "ERROR":
+                used_vcpus = used_vcpus + int(virsh_get_maxvcpus(vm[0]))
+            vms['actual_mem'] = int(virsh_get_maxvcpus(vm[0]))
+            vms['last_update'] = update
+            vmmgr_update(vms, 'guests', cur_guests)
+
+# generate host output
+
+maxcpus = 0
+cpuinfo = comm('cat /proc/cpuinfo')['out']
+for line in cpuinfo.split('\n'):
+    search = re.match("^processor.*$", line)
+    if search:
+        maxcpus = maxcpus + 1
+meminfo = host_mem()
+bug(meminfo)
+vms['mem_buffers'] = meminfo['buffers']
+vms['mem_total'] = meminfo['total']
+vms['mem_cached'] = meminfo['cached']
+vms['mem_free'] = meminfo['free']
+vms['cpus'] = maxcpus
+vms['total_maxvcpus'] = int(used_vcpus)
+vms['hostname'] = fqdn
+vms['cluster'] = fqdn
+vms['last_update'] = update
+vmmgr_update(vms, 'hosts', cur_hosts)
